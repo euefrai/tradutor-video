@@ -1,0 +1,22 @@
+# Ambientes virtuais e runtimes portáteis
+.venv/
+venv/
+env/
+.runtime/
+
+# Arquivos temporários de síntese de voz e vídeos exportados
+temp_tts/
+outputs/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Arquivos de sistema / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
