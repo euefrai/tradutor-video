@@ -267,10 +267,57 @@ async def synthesize_edge_tts(
     raise RuntimeError(f"Não foi possível sintetizar voz via edge-tts: {last_err}")
 
 
+def _translate_via_clients5_api(text: str, src: str, tgt: str) -> Optional[str]:
+    """
+    Traduz texto via endpoint oficial Chrome Extension (clients5.google.com),
+    que não sofre bloqueio 429 do translate.google.com/m nem do translate.googleapis.com.
+    """
+    q = urllib.parse.quote(text)
+    url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl={src}&tl={tgt}&q={q}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, list) and first:
+                translated = str(first[0])
+            elif isinstance(first, str):
+                translated = first
+            else:
+                translated = ""
+            if translated and translated.strip():
+                return translated.strip()
+    return None
+
+
+def _translate_via_mymemory_api(text: str, src: str, tgt: str) -> Optional[str]:
+    """
+    Fallback secundário gratuito via API MyMemory Translated (sem necessidade de chave).
+    """
+    if not src or src == "auto":
+        return None
+    q = urllib.parse.quote(text)
+    url = f"https://api.mymemory.translated.net/get?q={q}&langpair={src}|{tgt}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        translated = (data.get("responseData") or {}).get("translatedText")
+        if translated and isinstance(translated, str) and translated.strip():
+            return translated.strip()
+    return None
+
+
 def _translate_via_gtx_api(text: str, src: str, tgt: str) -> Optional[str]:
     """
-    Traduz texto instantaneamente via endpoint JSON oficial GTX do Google Translate
-    (sem bloqueio de scraping HTML do translate.google.com/m).
+    Traduz texto via endpoint JSON GTX do Google Translate.
     """
     q = urllib.parse.quote(text)
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src}&tl={tgt}&dt=t&q={q}"
@@ -294,7 +341,7 @@ def translate_text_segment(
     source_lang: str,
     target_lang: str,
 ) -> str:
-    """Traduz um segmento individual utilizando GTX JSON API + GoogleTranslator (deep-translator) como fallback."""
+    """Traduz um segmento individual utilizando múltiplos provedores gratuitos em cascata."""
     cleaned = text.strip()
     if not cleaned:
         return ""
@@ -305,22 +352,40 @@ def translate_text_segment(
     if src.split("-")[0].lower() == tgt.split("-")[0].lower():
         return cleaned
 
-    for attempt in range(3):
+    for attempt in range(2):
+        # 1. Chrome Extension endpoint (clients5) - ultra-rápido e imune a HTTP 429
         try:
-            gtx_res = _translate_via_gtx_api(cleaned, src, tgt)
-            if gtx_res:
-                return gtx_res
+            res = _translate_via_clients5_api(cleaned, src, tgt)
+            if res:
+                return res
+        except Exception as exc:
+            logger.debug(f"clients5 tentativa {attempt + 1} falhou: {exc}")
+
+        # 2. MyMemory API
+        try:
+            res = _translate_via_mymemory_api(cleaned, src, tgt)
+            if res:
+                return res
+        except Exception as exc:
+            logger.debug(f"mymemory tentativa {attempt + 1} falhou: {exc}")
+
+        # 3. Google GTX JSON endpoint
+        try:
+            res = _translate_via_gtx_api(cleaned, src, tgt)
+            if res:
+                return res
         except Exception as exc:
             logger.debug(f"GTX tentativa {attempt + 1} falhou: {exc}")
 
+        # 4. deep-translator GoogleTranslator
         try:
             translator = GoogleTranslator(source=src, target=tgt)
             translated = translator.translate(cleaned)
             if translated and translated.strip():
                 return translated.strip()
         except Exception as exc:
-            logger.warning(f"Tentativa {attempt + 1}/3 de tradução falhou: {exc}")
-            time.sleep(0.5 * (attempt + 1))
+            logger.warning(f"Tentativa {attempt + 1}/2 de tradução falhou: {exc}")
+            time.sleep(0.4 * (attempt + 1))
 
     return cleaned
 
@@ -331,8 +396,8 @@ def translate_segments_in_batches(
     target_lang: str,
 ) -> List[str]:
     """
-    Traduz todos os segmentos em lotes agrupados por quebra de linha via GTX JSON API + deep-translator
-    para máxima velocidade e zero bloqueio de rate-limit.
+    Traduz todos os segmentos em lotes agrupados por quebra de linha via clients5 + GTX + MyMemory
+    para máxima velocidade e zero bloqueio de rate-limit (HTTP 429).
     Caso o idioma detectado seja igual ao idioma de destino, mantém o texto original.
     """
     if not texts:
@@ -356,18 +421,17 @@ def translate_segments_in_batches(
         if not current_batch:
             return []
         joined = "\n".join(line.replace("\n", " ").strip() for line in current_batch)
-        for attempt in range(2):
+        for provider_fn in (_translate_via_clients5_api, _translate_via_gtx_api):
             try:
-                translated_block = _translate_via_gtx_api(joined, src_code, target_lang)
+                translated_block = provider_fn(joined, src_code, target_lang)
                 if translated_block:
                     split_lines = [ln.strip() for ln in translated_block.split("\n") if ln.strip()]
                     if len(split_lines) == len(current_batch):
                         return split_lines
             except Exception as exc:
-                logger.warning(f"Tentativa {attempt + 1}/2 de tradução GTX em lote falhou: {exc}")
-                time.sleep(0.4)
+                logger.debug(f"Provedor em lote {provider_fn.__name__} falhou: {exc}")
 
-        # Fallback individual rápido
+        # Fallback individual rápido (clients5 -> mymemory -> gtx -> deep-translator)
         fallback_out: List[str] = []
         for item in current_batch:
             fallback_out.append(translate_text_segment(item, src_code, target_lang))
@@ -375,7 +439,7 @@ def translate_segments_in_batches(
 
     for txt in texts:
         clean = txt.replace("\n", " ").strip()
-        if batch and (batch_chars + len(clean) > 2500 or len(batch) >= 15):
+        if batch and (batch_chars + len(clean) > 1800 or len(batch) >= 12):
             results.extend(_flush_batch(batch))
             batch = []
             batch_chars = 0
@@ -508,8 +572,9 @@ async def process_video_dubbing(
         dub_segments: List[DubSegment] = []
         prepared_overlays: List[Tuple[int, AudioSegment]] = []
 
-        # Pré-síntese paralela leve (4 conexões simultâneas) via edge-tts para máxima velocidade
-        tts_sem = asyncio.Semaphore(4)
+        # Pré-síntese paralela controlada (2 conexões simultâneas) via edge-tts
+        # evitando throttling de WebSockets simultâneos no servidor da Microsoft
+        tts_sem = asyncio.Semaphore(2)
         raw_tts_paths: List[Path] = [
             job_temp_dir / f"seg_{idx:04d}_raw.mp3" for idx in range(1, total_segs + 1)
         ]
@@ -523,14 +588,13 @@ async def process_video_dubbing(
                     rate="+0%",
                 )
 
-        notify(
-            32,
-            "Síntese Neural",
-            f"Gerando {total_segs} falas com a voz '{voice}' em alta velocidade...",
-        )
-        await asyncio.gather(
-            *(_synth_worker(i, txt) for i, txt in enumerate(translated_texts))
-        )
+        # Primeiro segmento aquece o ajuste de relógio DRM (Sec-MS-GEC) antes do paralelismo
+        if translated_texts:
+            await _synth_worker(0, translated_texts[0])
+        if len(translated_texts) > 1:
+            await asyncio.gather(
+                *(_synth_worker(i, txt) for i, txt in enumerate(translated_texts[1:], start=1))
+            )
 
         # Etapa 4 e 5: Ajuste Dinâmico de Tempo (Time-Stretching) e preparação de mixagem
         for idx, ((seg_start, seg_end, orig_text), translated_text) in enumerate(

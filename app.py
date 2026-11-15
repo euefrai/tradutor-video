@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import logging
 import os
 import shutil
@@ -15,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import uvicorn
 
+import dubber_engine
 from dubber_engine import (
     BASE_DIR,
     OUTPUTS_DIR,
@@ -145,7 +147,8 @@ async def start_dubbing_job(
 
     async def _run_job():
         try:
-            result = await process_video_dubbing(
+            importlib.reload(dubber_engine)
+            result = await dubber_engine.process_video_dubbing(
                 video_path=input_path,
                 output_video_path=output_path,
                 source_lang=source_lang,
