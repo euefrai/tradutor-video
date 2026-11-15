@@ -197,7 +197,8 @@ if ($SetupOnly) {
 }
 
 Write-Step "4/4 - Iniciando Tradutor & Dublador Automatico de Videos..."
-Write-Host "O navegador abrira automaticamente em http://127.0.0.1:8000" -ForegroundColor Green
+Write-Host "Detectando porta livre e abrindo a interface no navegador..." -ForegroundColor Green
 Write-Host "Pressione CTRL+C nesta janela quando quiser encerrar o aplicativo.`n" -ForegroundColor Gray
 
 & $VenvPython (Join-Path $ProjectRoot "app.py")
+exit $LASTEXITCODE

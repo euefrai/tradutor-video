@@ -13,7 +13,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_runtime.ps1" %*
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [ERRO] Ocorreu um problema durante a inicializacao do sistema.
-    echo Verifique sua conexao com a internet na primeira execucao e tente novamente.
-    pause
+    echo [ERRO] Ocorreu um problema durante a execucao do sistema (Codigo: %ERRORLEVEL%).
+    echo Verifique as mensagens acima e tente novamente.
 )
+echo.
+pause

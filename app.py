@@ -2,13 +2,14 @@ import asyncio
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -969,9 +970,39 @@ async def index():
     return HTMLResponse(content=HTML_INTERFACE)
 
 
-def open_browser_when_ready(url: str, delay: float = 1.5) -> None:
+def find_available_port(host: str = "127.0.0.1", preferred_ports: Optional[List[int]] = None) -> int:
+    """
+    Testa portas locais para evitar erros de porta ocupada ou bloqueada pelo Hyper-V/Windows NAT
+    (WinError 10013 / WinError 10048) e retorna a primeira porta livre e acessível.
+    """
+    candidates = list(preferred_ports or [7860, 8080, 8765, 5000, 3000, 8000])
+    candidates.extend(range(7861, 7910))
+
+    for port in candidates:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, port))
+                return port
+        except OSError:
+            continue
+
+    # Fallback garantido pelo sistema operacional
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+
+
+def open_browser_when_ready(host: str, port: int) -> None:
+    url = f"http://{host}:{port}"
+
     def _target():
-        time.sleep(delay)
+        # Aguarda o servidor responder de fato antes de abrir o navegador
+        for _ in range(30):
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.3)
         try:
             webbrowser.open(url)
         except Exception as exc:
@@ -982,9 +1013,22 @@ def open_browser_when_ready(url: str, delay: float = 1.5) -> None:
 
 if __name__ == "__main__":
     host = os.environ.get("TRADUTOR_HOST", "127.0.0.1")
-    port = int(os.environ.get("TRADUTOR_PORT", "8000"))
+    env_port = os.environ.get("TRADUTOR_PORT")
+    if env_port:
+        port = find_available_port(host, [int(env_port)])
+    else:
+        port = find_available_port(host, [7860, 8080, 8765, 5000, 8000])
+
     app_url = f"http://{host}:{port}"
+    print("\n" + "=" * 68)
+    print(f"  SERVIDOR ATIVO EM: {app_url}")
+    print("  O navegador abrira automaticamente nesta pagina.")
+    print("  Mantenha esta janela aberta enquanto estiver usando o tradutor.")
+    print("=" * 68 + "\n")
     logger.info(f"Iniciando servidor Tradutor & Dublador de Vídeos em {app_url}")
+
     if os.environ.get("TRADUTOR_NO_BROWSER") != "1":
-        open_browser_when_ready(app_url)
+        open_browser_when_ready(host, port)
+
     uvicorn.run(app, host=host, port=port, log_level="info")
+
