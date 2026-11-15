@@ -1,9 +1,14 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import time
+import urllib.parse
+import urllib.request
+import wave
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -11,7 +16,25 @@ from typing import Callable, Dict, List, Optional, Tuple
 from deep_translator import GoogleTranslator
 import edge_tts
 from faster_whisper import WhisperModel
+import numpy as np
 from pydub import AudioSegment
+
+# Força resolução IPv4 (AF_INET) para evitar travamentos de 20s+ em redes Windows com IPv6 instável
+# ao conectar nos WebSockets do Microsoft Edge-TTS e APIs de tradução.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        res = _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        if res:
+            return res
+    except OSError:
+        pass
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 # Configuração de logs
 logging.basicConfig(
@@ -142,33 +165,81 @@ def extract_original_audio(video_path: Path, wav_output_path: Path, ffmpeg_bin: 
         raise RuntimeError(f"Erro ao extrair áudio original do vídeo: {proc.stderr[-500:]}")
 
 
-def apply_atempo_stretch(
-    input_audio_path: Path,
-    output_audio_path: Path,
-    speed_factor: float,
-    ffmpeg_bin: str,
-) -> None:
+def extract_whisper_waveform_16k(
+    audio_or_video_path: Path, wav_16k_path: Path, ffmpeg_bin: str
+) -> np.ndarray:
     """
-    Aplica o filtro atempo do FFmpeg (limitado entre 1.0x e 1.35x) para ajustar
-    a duração da fala traduzida sem distorcer o tom (pitch) da voz.
+    Converte o áudio para WAV 16kHz mono PCM 16-bit via FFmpeg e carrega como array
+    NumPy float32 normalizado [-1.0, 1.0]. Isso evita incompatibilidades do PyAV
+    (ex: av.open metadata_errors) e acelera a leitura no faster-whisper.
+    """
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(audio_or_video_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(wav_16k_path),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not wav_16k_path.exists():
+        raise RuntimeError(f"Erro ao preparar áudio 16kHz para transcrição: {proc.stderr[-500:]}")
+
+    with wave.open(str(wav_16k_path), "rb") as wf:
+        num_frames = wf.getnframes()
+        raw_bytes = wf.readframes(num_frames)
+
+    pcm_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
+    return pcm_int16.astype(np.float32) / 32768.0
+
+
+def load_audio_segment_via_wav(
+    input_audio_path: Path,
+    ffmpeg_bin: str,
+    speed_factor: float = 1.0,
+) -> AudioSegment:
+    """
+    Converte qualquer arquivo de áudio (ex: MP3 do edge-tts) para WAV 44.1kHz estéreo
+    usando FFmpeg — aplicando opcionalmente o filtro atempo (1.0x a 1.35x) num único passo —
+    e carrega via AudioSegment.from_wav sem depender do ffprobe.
     """
     clamped_speed = min(max(speed_factor, 1.0), 1.35)
+    wav_out = input_audio_path.with_suffix(f".proc_{int(clamped_speed * 100)}.wav")
+
     cmd = [
         ffmpeg_bin,
         "-y",
         "-i",
         str(input_audio_path),
-        "-filter:a",
-        f"atempo={clamped_speed:.4f}",
-        "-vn",
-        str(output_audio_path),
     ]
+    if clamped_speed > 1.01:
+        cmd.extend(["-filter:a", f"atempo={clamped_speed:.4f}"])
+
+    cmd.extend(
+        [
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(wav_out),
+        ]
+    )
+
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0 or not output_audio_path.exists():
-        logger.warning(
-            f"Falha ao aplicar atempo={clamped_speed:.2f}, usando áudio original do TTS. Detalhe: {proc.stderr[-300:]}"
-        )
-        shutil.copyfile(input_audio_path, output_audio_path)
+    if proc.returncode != 0 or not wav_out.exists():
+        raise RuntimeError(f"Falha ao processar segmento de áudio no FFmpeg: {proc.stderr[-400:]}")
+
+    seg = AudioSegment.from_wav(str(wav_out))
+    return seg
 
 
 async def synthesize_edge_tts(
@@ -176,21 +247,46 @@ async def synthesize_edge_tts(
     voice: str,
     output_path: Path,
     rate: str = "+0%",
-    retries: int = 3,
+    retries: int = 4,
 ) -> None:
-    """Gera áudio de síntese neural com edge-tts na velocidade natural (+0%)."""
+    """Gera áudio de síntese neural com edge-tts na velocidade natural (+0%) com timeout de segurança."""
     last_err: Optional[Exception] = None
+    clean_text = text.strip() or "..."
     for attempt in range(1, retries + 1):
         try:
-            communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
-            await communicate.save(str(output_path))
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            communicate = edge_tts.Communicate(text=clean_text, voice=voice, rate=rate)
+            await asyncio.wait_for(communicate.save(str(output_path)), timeout=12.0)
             if output_path.exists() and output_path.stat().st_size > 0:
                 return
         except Exception as exc:
             last_err = exc
-            logger.warning(f"Tentativa {attempt}/{retries} do edge-tts falhou: {exc}")
-            await asyncio.sleep(1.0 * attempt)
+            logger.warning(f"Tentativa {attempt}/{retries} do edge-tts falhou ({ clean_text[:25]}...): {exc}")
+            await asyncio.sleep(0.5 * attempt)
     raise RuntimeError(f"Não foi possível sintetizar voz via edge-tts: {last_err}")
+
+
+def _translate_via_gtx_api(text: str, src: str, tgt: str) -> Optional[str]:
+    """
+    Traduz texto instantaneamente via endpoint JSON oficial GTX do Google Translate
+    (sem bloqueio de scraping HTML do translate.google.com/m).
+    """
+    q = urllib.parse.quote(text)
+    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src}&tl={tgt}&dt=t&q={q}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if data and isinstance(data, list) and data[0]:
+            translated = "".join(part[0] for part in data[0] if part and part[0])
+            if translated and translated.strip():
+                return translated.strip()
+    return None
 
 
 def translate_text_segment(
@@ -198,7 +294,7 @@ def translate_text_segment(
     source_lang: str,
     target_lang: str,
 ) -> str:
-    """Traduz um segmento de texto utilizando GoogleTranslator (deep-translator)."""
+    """Traduz um segmento individual utilizando GTX JSON API + GoogleTranslator (deep-translator) como fallback."""
     cleaned = text.strip()
     if not cleaned:
         return ""
@@ -206,10 +302,17 @@ def translate_text_segment(
     src = "auto" if not source_lang or source_lang.lower() == "auto" else source_lang
     tgt = target_lang or "pt"
 
-    if src == tgt:
+    if src.split("-")[0].lower() == tgt.split("-")[0].lower():
         return cleaned
 
     for attempt in range(3):
+        try:
+            gtx_res = _translate_via_gtx_api(cleaned, src, tgt)
+            if gtx_res:
+                return gtx_res
+        except Exception as exc:
+            logger.debug(f"GTX tentativa {attempt + 1} falhou: {exc}")
+
         try:
             translator = GoogleTranslator(source=src, target=tgt)
             translated = translator.translate(cleaned)
@@ -217,9 +320,72 @@ def translate_text_segment(
                 return translated.strip()
         except Exception as exc:
             logger.warning(f"Tentativa {attempt + 1}/3 de tradução falhou: {exc}")
-            time.sleep(0.6 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
 
     return cleaned
+
+
+def translate_segments_in_batches(
+    texts: List[str],
+    effective_source_lang: str,
+    target_lang: str,
+) -> List[str]:
+    """
+    Traduz todos os segmentos em lotes agrupados por quebra de linha via GTX JSON API + deep-translator
+    para máxima velocidade e zero bloqueio de rate-limit.
+    Caso o idioma detectado seja igual ao idioma de destino, mantém o texto original.
+    """
+    if not texts:
+        return []
+
+    src_base = (effective_source_lang or "auto").split("-")[0].lower()
+    tgt_base = (target_lang or "pt").split("-")[0].lower()
+
+    if src_base == tgt_base:
+        logger.info(
+            f"Idioma de origem ({effective_source_lang}) igual ao de destino ({target_lang}); mantendo falas originais."
+        )
+        return [t.strip() for t in texts]
+
+    src_code = "auto" if not effective_source_lang else effective_source_lang
+    results: List[str] = []
+    batch: List[str] = []
+    batch_chars = 0
+
+    def _flush_batch(current_batch: List[str]) -> List[str]:
+        if not current_batch:
+            return []
+        joined = "\n".join(line.replace("\n", " ").strip() for line in current_batch)
+        for attempt in range(2):
+            try:
+                translated_block = _translate_via_gtx_api(joined, src_code, target_lang)
+                if translated_block:
+                    split_lines = [ln.strip() for ln in translated_block.split("\n") if ln.strip()]
+                    if len(split_lines) == len(current_batch):
+                        return split_lines
+            except Exception as exc:
+                logger.warning(f"Tentativa {attempt + 1}/2 de tradução GTX em lote falhou: {exc}")
+                time.sleep(0.4)
+
+        # Fallback individual rápido
+        fallback_out: List[str] = []
+        for item in current_batch:
+            fallback_out.append(translate_text_segment(item, src_code, target_lang))
+        return fallback_out
+
+    for txt in texts:
+        clean = txt.replace("\n", " ").strip()
+        if batch and (batch_chars + len(clean) > 2500 or len(batch) >= 15):
+            results.extend(_flush_batch(batch))
+            batch = []
+            batch_chars = 0
+        batch.append(clean)
+        batch_chars += len(clean) + 1
+
+    if batch:
+        results.extend(_flush_batch(batch))
+
+    return results
 
 
 async def generate_voice_preview(
@@ -249,8 +415,8 @@ async def process_video_dubbing(
     """
     Pipeline completo de Tradução e Dublagem Automática:
     1. Extração da trilha de áudio original.
-    2. Transcrição com faster-whisper (int8 + vad_filter=True).
-    3. Tradução de cada segmento com deep-translator (GoogleTranslator).
+    2. Transcrição com faster-whisper (int8 + vad_filter=True) usando waveform 16kHz.
+    3. Tradução rápida em lote com deep-translator (GoogleTranslator).
     4. Síntese de voz natural com edge-tts (rate="+0%").
     5. Ajuste dinâmico de tempo (Time-Stretching via FFmpeg atempo 1.0x a 1.35x).
     6. Mixagem com pydub (ducking configurável + overlay no milissegundo exato).
@@ -268,10 +434,15 @@ async def process_video_dubbing(
     job_temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Etapa 1: Extrair áudio original
+        # Etapa 1: Extrair áudio original (44.1kHz estéreo para mixagem + 16kHz mono para Whisper)
         notify(5, "Extração de Áudio", "Extraindo faixa de áudio original do vídeo...")
         original_wav = job_temp_dir / "original_audio.wav"
+        whisper_16k_wav = job_temp_dir / "whisper_16k.wav"
+
         await asyncio.to_thread(extract_original_audio, video_path, original_wav, ffmpeg_bin)
+        waveform_16k = await asyncio.to_thread(
+            extract_whisper_waveform_16k, original_wav, whisper_16k_wav, ffmpeg_bin
+        )
 
         # Etapa 2: Carregar modelo faster-whisper e transcrever
         notify(
@@ -290,7 +461,7 @@ async def process_video_dubbing(
 
         def _run_transcription():
             segments_gen, info = model.transcribe(
-                str(original_wav),
+                waveform_16k,
                 language=whisper_lang,
                 beam_size=5,
                 vad_filter=True,
@@ -311,10 +482,20 @@ async def process_video_dubbing(
             )
 
         total_segs = len(raw_segments)
+        effective_src_lang = detected_lang if source_lang == "auto" else source_lang
+
         notify(
-            28,
-            "Transcrição Concluída",
-            f"{total_segs} segmentos de fala detectados (Idioma identificado: {detected_lang}). Iniciando tradução e dublagem...",
+            26,
+            "Tradução Inteligente",
+            f"{total_segs} falas detectadas (Idioma: {detected_lang}). Traduzindo roteiro para '{target_lang}'...",
+        )
+
+        original_texts = [seg[2] for seg in raw_segments]
+        translated_texts = await asyncio.to_thread(
+            translate_segments_in_batches,
+            original_texts,
+            effective_src_lang,
+            target_lang,
         )
 
         # Carregar áudio base no pydub e aplicar Ducking
@@ -327,8 +508,34 @@ async def process_video_dubbing(
         dub_segments: List[DubSegment] = []
         prepared_overlays: List[Tuple[int, AudioSegment]] = []
 
-        # Etapa 3, 4 e 5: Tradução, TTS e Ajuste Dinâmico de Tempo (Time-Stretching)
-        for idx, (seg_start, seg_end, orig_text) in enumerate(raw_segments, start=1):
+        # Pré-síntese paralela leve (4 conexões simultâneas) via edge-tts para máxima velocidade
+        tts_sem = asyncio.Semaphore(4)
+        raw_tts_paths: List[Path] = [
+            job_temp_dir / f"seg_{idx:04d}_raw.mp3" for idx in range(1, total_segs + 1)
+        ]
+
+        async def _synth_worker(idx_zero: int, text_val: str):
+            async with tts_sem:
+                await synthesize_edge_tts(
+                    text=text_val,
+                    voice=voice,
+                    output_path=raw_tts_paths[idx_zero],
+                    rate="+0%",
+                )
+
+        notify(
+            32,
+            "Síntese Neural",
+            f"Gerando {total_segs} falas com a voz '{voice}' em alta velocidade...",
+        )
+        await asyncio.gather(
+            *(_synth_worker(i, txt) for i, txt in enumerate(translated_texts))
+        )
+
+        # Etapa 4 e 5: Ajuste Dinâmico de Tempo (Time-Stretching) e preparação de mixagem
+        for idx, ((seg_start, seg_end, orig_text), translated_text) in enumerate(
+            zip(raw_segments, translated_texts), start=1
+        ):
             # Janela disponível até o início da próxima fala (ou fim do vídeo)
             if idx < total_segs:
                 next_start = raw_segments[idx][0]
@@ -336,24 +543,11 @@ async def process_video_dubbing(
             else:
                 available_window = max(0.5, max(seg_end - seg_start, total_duration_s - seg_start))
 
-            # Traduzir segmento
-            translated_text = await asyncio.to_thread(
-                translate_text_segment,
-                orig_text,
-                source_lang,
-                target_lang,
-            )
+            raw_tts_path = raw_tts_paths[idx - 1]
 
-            # Sintetizar voz com edge-tts em velocidade 100% natural (+0%)
-            raw_tts_path = job_temp_dir / f"seg_{idx:04d}_raw.mp3"
-            await synthesize_edge_tts(
-                text=translated_text,
-                voice=voice,
-                output_path=raw_tts_path,
-                rate="+0%",
+            tts_seg_audio = await asyncio.to_thread(
+                load_audio_segment_via_wav, raw_tts_path, ffmpeg_bin, 1.0
             )
-
-            tts_seg_audio = await asyncio.to_thread(AudioSegment.from_file, str(raw_tts_path))
             tts_duration = len(tts_seg_audio) / 1000.0
 
             # Verificar necessidade de Time-Stretching com FFmpeg atempo (1.0x a 1.35x)
@@ -364,16 +558,11 @@ async def process_video_dubbing(
                 raw_ratio = tts_duration / available_window
                 speed_factor = round(min(max(raw_ratio, 1.0), 1.35), 2)
                 if speed_factor > 1.01:
-                    stretched_tts_path = job_temp_dir / f"seg_{idx:04d}_stretched.mp3"
-                    await asyncio.to_thread(
-                        apply_atempo_stretch,
-                        raw_tts_path,
-                        stretched_tts_path,
-                        speed_factor,
-                        ffmpeg_bin,
-                    )
                     final_seg_audio = await asyncio.to_thread(
-                        AudioSegment.from_file, str(stretched_tts_path)
+                        load_audio_segment_via_wav,
+                        raw_tts_path,
+                        ffmpeg_bin,
+                        speed_factor,
                     )
                 else:
                     speed_factor = 1.0
@@ -446,6 +635,8 @@ async def process_video_dubbing(
                 "copy",
                 "-c:a",
                 "aac",
+                "-strict",
+                "-2",
                 "-b:a",
                 "192k",
                 "-movflags",
@@ -477,6 +668,8 @@ async def process_video_dubbing(
                     "21",
                     "-c:a",
                     "aac",
+                    "-strict",
+                    "-2",
                     "-b:a",
                     "192k",
                     "-movflags",
